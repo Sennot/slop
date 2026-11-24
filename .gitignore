@@ -2,3 +2,7 @@ build/
 build-*/
 .cache/
 .vscode/
+tools/*.exe
+tools/*.obj
+*.csv
+*.png
