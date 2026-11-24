@@ -2,24 +2,26 @@
 #include <cstddef>
 #include <vector>
 
-// Geode-free geometry: stroke -> slope pieces.
+// Geode-free geometry: strokes and recorded wave routes -> slope pieces.
 namespace slop {
 
 struct V {
     double x = 0, y = 0;
 };
 
-enum class Kind { S45, S63, Flat };
+enum class Kind { S45, S63, S26, Free, Flat };
 enum class Wave { Auto, Big, Mini };
 
 struct Piece {
     Kind kind = Kind::S45;
-    V c;            // object center, level units
+    int base = 1;       // 1 = 1x1 slope object, 2 = 2x1 slope object
+    V c;                // object center, level units
     bool fx = false, fy = false;
-    int rot = 0;    // degrees, clockwise
+    int rot = 0;        // degrees, clockwise
     double sx = 1, sy = 1;
     bool ceil = false;
-    V poly[4];      // outline for preview
+    double tight = 1;   // preview color: 0 = no room, 1 = roomy
+    V poly[4];          // outline for preview
     int n = 0;
 };
 
@@ -35,7 +37,31 @@ struct Opts {
     std::size_t maxPieces = 600;
 };
 
+// One physics step of a wave player.
+struct Sample {
+    float x = 0, y = 0, hh = 0; // hitbox center, half height
+    float up = 0, down = 0;     // free space above / below the hitbox at that moment
+    unsigned char p = 0, mini = 0, brk = 0;
+};
+
+// One continuous wave part of the route.
+struct Section {
+    int p = 0;
+    bool mini = false;
+    std::vector<V> path;        // simplified path
+    std::vector<double> lo, hi; // per path segment: distance from path to floor / ceiling wall
+    double hh = 0;
+    V mid;
+};
+
+std::vector<std::size_t> simplifyIdx(std::vector<V> const& pts, double eps);
 std::vector<V> simplify(std::vector<V> const& pts, double eps);
 std::vector<Piece> build(std::vector<V> const& pts, Opts const& o);
+
+std::vector<Section> sections(std::vector<Sample> const& s, double maxGap);
+void walls(Section const& sec, double margin, bool haveTwo, bool baseRight, std::vector<Piece>& out);
+
+void slopeTri(double cx, double cy, double w, double h, bool fx, bool fy, int rot, bool baseRight, V out[3]);
+void clearance(V const* poly, int n, double x0, double x1, double y0, double y1, double& up, double& down);
 
 }
