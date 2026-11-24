@@ -86,6 +86,7 @@ struct Params {
     double tol = .5;       // boundary fit tolerance
     double wallScale = 1;  // wall distance = hitbox half size * this
     double margin = 0;     // manual gap tweak per section
+    double hw = 0;         // hitbox half width if not square (0 = same as half height)
     bool haveTwo = true, baseRight = true;
 };
 

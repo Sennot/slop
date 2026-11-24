@@ -138,19 +138,41 @@ int main(int argc, char** argv) {
     auto secs = split(r);
     bool isSection = cmd == "section";
     Params prm = params(argc, argv, isSection ? 5 : cmd == "pieces" ? 4 : 3);
-    for (auto& s : secs) solve(r, s, prm);
+    // The recorded strip used the real hitbox width, which is not always the height (mini wave):
+    // per part, take the half width that makes the slope version match best.
+    std::vector<double> bestHw(secs.size(), 0);
+    for (size_t i = 0; i < secs.size(); i++) {
+        auto& s = secs[i];
+        double hh = r.ticks[s.ti[s.ti.size() / 2]].hh; // the first tick can still have the old size
+        std::vector<std::pair<double, double>> tried;      // factor, score
+        double best = -1;
+        for (double f = .5; f <= 1.31; f += .05) {
+            Params p = prm;
+            p.hw = hh * f;
+            solve(r, s, p);
+            tried.push_back({f, s.score});
+            best = std::max(best, s.score);
+        }
+        double pick = -1;
+        for (auto [f, sc] : tried) // among the best (within 0.15%), the one closest to a square hitbox
+            if (sc >= best - .15 && (pick < 0 || std::abs(f - 1) < std::abs(pick - 1))) pick = f;
+        bestHw[i] = hh * pick;
+        Params p = prm;
+        p.hw = bestHw[i];
+        solve(r, s, p);
+    }
 
     if (cmd == "summary") {
         std::printf("ticks %zu obstacles %zu inputs %zu objects %zu\n", r.ticks.size(), r.obs.size(), r.inputs.size(), r.cands.size());
-        std::puts("part p mini  ticks      x0      x1   hh  fHaz fSol anom  match clicks tight diff pieces");
+        std::puts("part p mini  ticks      x0      x1   hh   hw  fHaz fSol anom  match clicks tight diff pieces");
         for (size_t i = 0; i < secs.size(); i++) {
             auto const& s = secs[i];
             int tight, diff;
             stats(s, tight, diff);
             double hh = 0;
             for (auto t : s.ti) hh += r.ticks[t].hh;
-            std::printf("%4zu %d %4d %6zu %7.0f %7.0f %4.1f %5.2f %4.2f %4d %5.1f%% %6zu %5d %4d %6zu\n", i + 1, s.p, s.mini, s.ti.size(), s.x0, s.x1,
-                        hh / s.ti.size(), s.fHaz, s.fSolid, s.anomalies, s.score, s.clicks.size(), tight, diff, s.pieces.size());
+            std::printf("%4zu %d %4d %6zu %7.0f %7.0f %4.1f %4.2f %5.2f %4.2f %4d %5.1f%% %6zu %5d %4d %6zu\n", i + 1, s.p, s.mini, s.ti.size(), s.x0,
+                        s.x1, hh / s.ti.size(), bestHw[i], s.fHaz, s.fSolid, s.anomalies, s.score, s.clicks.size(), tight, diff, s.pieces.size());
         }
         return 0;
     }

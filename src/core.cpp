@@ -581,8 +581,9 @@ void solve(Route const& r, Section& s, Params const& prm) {
     }
     hh /= n;
     s.pieces.clear();
-    fitWall(fl, fo, wid, false, hh * s.fSolid * prm.wallScale, hh, prm, s.pieces);
-    fitWall(ce, co, wid, true, hh * s.fSolid * prm.wallScale, hh, prm, s.pieces);
+    double hw = prm.hw > 0 ? prm.hw : hh;
+    fitWall(fl, fo, wid, false, hh * s.fSolid * prm.wallScale, hw, prm, s.pieces);
+    fitWall(ce, co, wid, true, hh * s.fSolid * prm.wallScale, hw, prm, s.pieces);
 
     // the same analysis on the generated geometry
     struct PB {
@@ -600,7 +601,8 @@ void solve(Route const& r, Section& s, Params const& prm) {
     std::size_t start = 0;
     for (std::size_t i = 0; i < n; i++) {
         auto const& t = T(i);
-        double hx0 = t.x - t.hh, hx1 = t.x + t.hh, es = t.hh * s.fSolid;
+        double hx = prm.hw > 0 ? prm.hw : t.hh;
+        double hx0 = t.x - hx, hx1 = t.x + hx, es = t.hh * s.fSolid;
         Ivs bl;
         while (start < pb.size() && pb[start].x1 < hx0 - 200) start++;
         for (std::size_t q = start; q < pb.size() && pb[q].x0 <= hx1; q++) {

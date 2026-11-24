@@ -74,5 +74,9 @@ Algorithm fixes: change `src/core.cpp`, rebuild the tool, `pieces` -> user press
   channel by ~20 units where the slope version has no such corridor.
 - A sloped wall touches the square hitbox with a corner: offset is `hh*(1+|slope|)`, not `hh`.
 - Playing an applied copy used to overwrite its route — now `.applied` -> `.slope.bin`.
+- The recorded strip uses the real hitbox width, which is not always its height (mini wave on
+  Sonic Wave: 63-85% match, steady ~1.7 off on 63° walls). `slop_tool` now fits `Params::hw` per part
+  (closest to square among the best) -> 99.6-100%. The mod itself still assumes hw = hh: if
+  the user wants it in-mod, record the half width in `Tick` (new file magic) instead.
 - Not verified in game: wave vs slope collision (slide or die), ground bounds from ground
   layers, replay precision with CBF. `Unrotated slope rises right` setting flips the slope model.
