@@ -3,13 +3,17 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/LevelEditorLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include "core.hpp"
@@ -29,6 +33,8 @@ int readMods() { return held(kCtrl) | (held(kShift) << 1) | (held(kAlt) << 2); }
 
 template <class T>
 T opt(char const* key) { return Mod::get()->getSettingValue<T>(key); }
+
+void notify(std::string const& s, NotificationIcon icon = NotificationIcon::Info) { Notification::create(s, icon)->show(); }
 
 // Chaikin smoothing, display only.
 std::vector<CCPoint> smooth(std::vector<slop::V> const& raw) {
@@ -104,7 +110,33 @@ public:
     }
 };
 
-// ---- slope families -------------------------------------------------------
+// Runs a function next frame, outside whatever game code is on the stack now.
+class Deferred : public CCNode {
+public:
+    std::function<void()> fn;
+
+    static void run(std::function<void()> f) {
+        auto scene = CCDirector::get()->getRunningScene();
+        if (!scene) return;
+        auto d = new Deferred();
+        d->init();
+        d->autorelease();
+        d->fn = std::move(f);
+        scene->addChild(d);
+        d->scheduleUpdate();
+    }
+
+    void update(float) override {
+        auto f = fn;
+        unscheduleUpdate();
+        retain();
+        removeFromParent();
+        if (f) f();
+        autorelease();
+    }
+};
+
+// ---- slope families -------------------------------------------------------------
 
 std::unordered_map<int, std::string> const& frames() {
     static std::unordered_map<int, std::string> f;
@@ -147,10 +179,9 @@ std::unordered_map<int, Family> g_fam;
 
 // The other size of the same block set: nearby id with the longest shared frame name.
 Family family(LevelEditorLayer* lel, int id) {
-    auto& cache = g_fam;
-    if (auto it = cache.find(id); it != cache.end()) return it->second;
+    if (auto it = g_fam.find(id); it != g_fam.end()) return it->second;
     int c = sizeClass(lel, id);
-    if (!c) return cache[id] = {};
+    if (!c) return g_fam[id] = {};
     auto const& name = frames().at(id);
     int best = 0, bestScore = -1;
     for (int d = -12; d <= 12; d++) {
@@ -161,7 +192,7 @@ Family family(LevelEditorLayer* lel, int id) {
         int score = pre * 64 - std::abs(d) * 2 + ((d > 0) == (c == 1));
         if (score > bestScore) bestScore = score, best = id + d;
     }
-    return cache[id] = c == 1 ? Family{id, best} : Family{best, id};
+    return g_fam[id] = c == 1 ? Family{id, best} : Family{best, id};
 }
 
 // Object props copied from a selected slope, minus everything slop sets itself.
@@ -192,20 +223,34 @@ Template g_tpl;
 int g_lastIndex = -1;
 void* g_lastSel = nullptr;
 
-// ---- route recording -----------------------------------------------------------
+bool twoGuess() {
+    auto it = g_fam.find(g_tpl.id);
+    return it == g_fam.end() || it->second.two;
+}
 
-constexpr double kCap = 300;
+// ---- route recording ------------------------------------------------------------
 
 struct Recorder {
     GJBaseGameLayer* layer = nullptr;
-    std::vector<GameObject*> cands;
-    std::vector<slop::Sample> s;
+    std::vector<GameObject*> objs; // index = cand
+    slop::Route r;
     bool brk[2] = {true, true}, has[2] = {false, false}, mini[2] = {false, false};
     float lx[2] = {0, 0}, ly[2] = {0, 0};
 };
 
 Recorder g_rec;
 bool g_routeDirty = true;
+
+struct TestRun {
+    bool on = false, started = false, failed = false, done = false;
+    size_t next = 0;
+    std::vector<slop::Input> in;
+    float endX = 0, failX = 0;
+    double f = 1;
+    EditorUI* ui = nullptr;
+};
+
+TestRun g_test;
 
 std::filesystem::path routeFile(GJGameLevel* level) {
     std::string n = level ? std::string(level->m_levelName.c_str()) : "";
@@ -214,108 +259,203 @@ std::filesystem::path routeFile(GJGameLevel* level) {
     auto dir = Mod::get()->getSaveDir() / "routes";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    return dir / ((n.empty() ? "unnamed" : n) + ".txt");
+    return dir / ((n.empty() ? "unnamed" : n) + ".bin");
 }
 
-std::vector<slop::Sample> loadRoute(GJGameLevel* level) {
-    std::vector<slop::Sample> s;
-    std::ifstream f(routeFile(level));
-    slop::Sample x;
-    int p, mini, brk;
-    while (f >> p >> mini >> brk >> x.x >> x.y >> x.hh >> x.up >> x.down) {
-        x.p = (unsigned char)p, x.mini = (unsigned char)mini, x.brk = (unsigned char)brk;
-        s.push_back(x);
-    }
-    return s;
+template <class T>
+void putVec(std::ofstream& f, std::vector<T> const& v) {
+    uint32_t n = (uint32_t)v.size();
+    f.write((char const*)&n, 4);
+    if (n) f.write((char const*)v.data(), n * sizeof(T));
 }
 
-// The new run replaces the stored route over the x range it covers, so a part can be re-recorded.
+template <class T>
+bool getVec(std::ifstream& f, std::vector<T>& v) {
+    uint32_t n = 0;
+    if (!f.read((char*)&n, 4) || n > 100000000) return false;
+    v.resize(n);
+    return !n || (bool)f.read((char*)v.data(), n * sizeof(T));
+}
+
+bool readRoute(GJGameLevel* level, slop::Route& r) {
+    std::ifstream f(routeFile(level), std::ios::binary);
+    char magic[4];
+    if (!f.read(magic, 4) || std::memcmp(magic, "SLP2", 4)) return false;
+    return getVec(f, r.ticks) && getVec(f, r.obs) && getVec(f, r.inputs) && getVec(f, r.cands);
+}
+
+void writeRoute(GJGameLevel* level, slop::Route const& r) {
+    std::ofstream f(routeFile(level), std::ios::binary);
+    f.write("SLP2", 4);
+    putVec(f, r.ticks);
+    putVec(f, r.obs);
+    putVec(f, r.inputs);
+    putVec(f, r.cands);
+}
+
+void clearRun() {
+    g_rec.r.ticks.clear();
+    g_rec.r.obs.clear();
+    g_rec.r.inputs.clear();
+}
+
 void saveRoute(GJGameLevel* level) {
-    if (g_rec.s.empty()) return;
-    float a = 1e9f, b = -1e9f;
-    for (auto& x : g_rec.s) a = std::min(a, x.x), b = std::max(b, x.x);
-    auto old = loadRoute(level);
-    std::vector<slop::Sample> out;
-    for (auto& x : old)
-        if (x.x < a) out.push_back(x);
-    bool first[2] = {true, true};
-    for (auto x : g_rec.s) {
-        if (first[x.p]) x.brk = 1, first[x.p] = false;
-        out.push_back(x);
-    }
-    first[0] = first[1] = true;
-    for (auto x : old) {
-        if (x.x <= b) continue;
-        if (first[x.p]) x.brk = 1, first[x.p] = false;
-        out.push_back(x);
-    }
-    std::ofstream f(routeFile(level));
-    f.precision(10);
-    for (auto& x : out)
-        f << (int)x.p << ' ' << (int)x.mini << ' ' << (int)x.brk << ' ' << x.x << ' ' << x.y << ' ' << x.hh << ' ' << x.up << ' ' << x.down << '\n';
-    g_rec.s.clear();
-    g_routeDirty = true;
-    Notification::create("slop: route saved, " + std::to_string(slop::sections(out, kCap).size()) + " wave parts", NotificationIcon::Success)->show();
-}
-
-// One physics step: wave hitbox + free space above/below it against everything that can kill
-// it right now (moved by triggers, toggled, rotated - whatever the game says at this moment).
-void sample(GJBaseGameLayer* gl, PlayerObject* pl, int idx) {
-    if (!pl || !opt<bool>("record")) return;
-    if (g_rec.layer != gl) {
-        g_rec = {};
-        g_rec.layer = gl;
-        for (auto o : CCArrayExt<GameObject*>(gl->m_objects)) {
-            auto t = o->m_objectType;
-            if (t == GameObjectType::Solid || t == GameObjectType::Hazard || t == GameObjectType::Slope) g_rec.cands.push_back(o);
-        }
-    }
-    if (!pl->m_isDart) {
-        g_rec.brk[idx] = true;
-        return;
-    }
-    auto r = pl->getObjectRect();
-    double x0 = r.getMinX(), x1 = r.getMaxX(), y0 = r.getMinY(), y1 = r.getMaxY();
-    float cx = r.getMidX(), cy = r.getMidY();
-    bool mini = pl->m_vehicleSize < .9f;
-    auto& R = g_rec;
-    if (R.has[idx]) {
-        if (cx < R.lx[idx] - 40) { // respawn: drop what came after the respawn point
-            while (!R.s.empty() && R.s.back().x > cx - 1) R.s.pop_back();
-            R.brk[0] = R.brk[1] = true;
-        } else if (std::abs(cx - R.lx[idx]) > 40 || std::abs(cy - R.ly[idx]) > 40 || mini != R.mini[idx]) {
-            R.brk[idx] = true;
-        } else if (std::abs(cx - R.lx[idx]) < .01f && std::abs(cy - R.ly[idx]) < .01f) {
+    auto& r = g_rec.r;
+    if (r.ticks.empty()) return;
+    float mx = -1e9f;
+    for (auto& t : r.ticks) mx = std::max(mx, t.x);
+    slop::Route old;
+    if (readRoute(level, old)) {
+        float omx = -1e9f;
+        for (auto& t : old.ticks) omx = std::max(omx, t.x);
+        if (omx > mx + 30) {
+            notify("slop: shorter run, the old route is kept", NotificationIcon::Warning);
+            clearRun();
             return;
         }
     }
-    double up = kCap, down = kCap;
+    writeRoute(level, r);
+    notify("slop: route saved, " + std::to_string(slop::split(r).size()) + " wave parts, " + std::to_string(r.inputs.size()) + " clicks",
+           NotificationIcon::Success);
+    log::info("route saved: {} ticks, {} obstacles, {} inputs, {} objects", r.ticks.size(), r.obs.size(), r.inputs.size(), r.cands.size());
+    clearRun();
+    g_routeDirty = true;
+}
+
+void collect(GJBaseGameLayer* gl) {
+    g_rec = {};
+    g_rec.layer = gl;
+    for (auto o : CCArrayExt<GameObject*>(gl->m_objects)) {
+        auto t = o->m_objectType;
+        if (t != GameObjectType::Solid && t != GameObjectType::Hazard && t != GameObjectType::Slope) continue;
+        g_rec.objs.push_back(o);
+        g_rec.r.cands.push_back({o->m_objectID, o->m_startPosition.x, o->m_startPosition.y});
+    }
+}
+
+// Hitbox shape of an object right now: slope triangle, rotated box or plain rect.
+int polyOf(GameObject* o, CCRect const& b, bool baseRight, slop::V* poly) {
+    float rot = o->getRotation(), m90 = std::fmod(std::abs(rot), 90.f);
+    if (o->m_objectType == GameObjectType::Slope) {
+        int r90 = ((int)std::lround(rot / 90) % 4 + 4) % 4;
+        slop::slopeTri(b.getMidX(), b.getMidY(), b.size.width, b.size.height, o->m_isFlipX, o->m_isFlipY, r90 * 90, baseRight, poly);
+        return 3;
+    }
+    if (m90 > .5f && m90 < 89.5f && o->m_orientedBox) {
+        for (int i = 0; i < 4; i++) poly[i] = {o->m_orientedBox->m_corners[i].x, o->m_orientedBox->m_corners[i].y};
+        return 4;
+    }
+    poly[0] = {b.getMinX(), b.getMinY()};
+    poly[1] = {b.getMaxX(), b.getMinY()};
+    poly[2] = {b.getMaxX(), b.getMaxY()};
+    poly[3] = {b.getMinX(), b.getMaxY()};
+    return 4;
+}
+
+// respawn: drop everything recorded after the respawn point
+void truncate(float x) {
+    auto& r = g_rec.r;
+    while (!r.ticks.empty() && r.ticks.back().x > x - 1) {
+        r.obs.resize(r.ticks.back().first);
+        r.ticks.pop_back();
+    }
+    while (!r.inputs.empty() && r.inputs.back().x > x - 1) r.inputs.pop_back();
+    g_rec.brk[0] = g_rec.brk[1] = true;
+}
+
+// ground / ceiling line, if shown and consistent with where the player is
+void addBound(GJBaseGameLayer* gl, GJGroundLayer* g, float cy, float hh, bool bottom) {
+    if (!g || !g->isVisible() || !g->getParent()) return;
+    float y = gl->m_objectLayer->convertToNodeSpace(g->convertToWorldSpace({0, 0})).y;
+    if (bottom ? cy - hh < y - 2 : cy + hh > y + 2) return;
+    g_rec.r.obs.push_back(bottom ? slop::Obstacle{-1e6f, y, 3, -1} : slop::Obstacle{y, 1e6f, 3, -1});
+}
+
+void stopTestLater() {
+    Deferred::run([] {
+        if (g_test.on && g_test.ui) g_test.ui->onStopPlaytest(nullptr);
+    });
+}
+
+void testFail(float x) {
+    if (!g_test.on || g_test.failed || g_test.done) return;
+    g_test.failed = true;
+    g_test.failX = x;
+    stopTestLater();
+}
+
+// One physics step of one player: the wave hitbox and every obstacle in its column as it is
+// right now (moved, rotated, toggled - whatever the triggers did).
+void sample(GJBaseGameLayer* gl, PlayerObject* pl, int idx) {
+    if (!pl) return;
+    bool testing = g_test.on;
+    if (!testing && !opt<bool>("record")) return;
+    if (g_rec.layer != gl) collect(gl);
+    auto& R = g_rec;
+    if (!pl->m_isDart) {
+        R.brk[idx] = true;
+        return;
+    }
+    CCRect rc = pl->getObjectRect();
+    float cx = rc.getMidX(), cy = rc.getMidY(), hh = rc.size.height / 2;
+    bool mini = pl->m_vehicleSize < .9f;
+    if (R.has[idx] && !testing) {
+        if (cx < R.lx[idx] - 40) truncate(cx);
+        else if (std::abs(cx - R.lx[idx]) > 40 || std::abs(cy - R.ly[idx]) > 40 || mini != R.mini[idx]) R.brk[idx] = true;
+        else if (std::abs(cx - R.lx[idx]) < .001f && std::abs(cy - R.ly[idx]) < .001f) return;
+    }
+    double x0 = rc.getMinX(), x1 = rc.getMaxX(), win = opt<double>("window") + 60;
     bool baseRight = opt<bool>("base-rises-right");
-    for (auto o : R.cands) {
+    uint32_t first = (uint32_t)R.r.obs.size();
+    float hitH = hh * (float)g_test.f * .97f;
+    for (size_t c = 0; c < R.objs.size(); c++) {
+        auto o = R.objs[c];
         if (o->m_isGroupDisabled || o->m_isDisabled || o->m_isNoTouch || o->m_isPassable) continue;
         auto const& b = o->getObjectRect();
-        if (b.getMaxX() < x0 || b.getMinX() > x1 || b.getMinY() > y1 + kCap || b.getMaxY() < y0 - kCap) continue;
+        if (b.getMaxX() < x0 || b.getMinX() > x1 || b.getMinY() > cy + win || b.getMaxY() < cy - win) continue;
         slop::V poly[4];
-        int n = 4;
-        float rot = o->getRotation(), m90 = std::fmod(std::abs(rot), 90.f);
-        if (o->m_objectType == GameObjectType::Slope) {
-            int r90 = ((int)std::lround(rot / 90) % 4 + 4) % 4;
-            slop::slopeTri(b.getMidX(), b.getMidY(), b.size.width, b.size.height, o->m_isFlipX, o->m_isFlipY, r90 * 90, baseRight, poly);
-            n = 3;
-        } else if (m90 > .5f && m90 < 89.5f && o->m_orientedBox) {
-            for (int i = 0; i < 4; i++) poly[i] = {o->m_orientedBox->m_corners[i].x, o->m_orientedBox->m_corners[i].y};
-        } else {
-            poly[0] = {b.getMinX(), b.getMinY()};
-            poly[1] = {b.getMaxX(), b.getMinY()};
-            poly[2] = {b.getMaxX(), b.getMaxY()};
-            poly[3] = {b.getMinX(), b.getMaxY()};
+        int n = polyOf(o, b, baseRight, poly);
+        double lo, hi;
+        if (!slop::spanOver(poly, n, x0, x1, lo, hi)) continue;
+        uint8_t type = o->m_objectType == GameObjectType::Hazard ? 0 : o->m_objectType == GameObjectType::Slope ? 2 : 1;
+        if (testing) {
+            if (type == 0 && lo < cy + hitH && hi > cy - hitH) testFail(cx);
+            continue;
         }
-        slop::clearance(poly, n, x0, x1, y0, y1, up, down);
+        R.r.obs.push_back({(float)lo, (float)hi, type, (int32_t)c});
     }
-    R.s.push_back({cx, cy, (float)(y1 - y0) / 2, (float)up, (float)down, (unsigned char)idx, (unsigned char)mini, (unsigned char)R.brk[idx]});
+    if (testing) return;
+    addBound(gl, gl->m_groundLayer, cy, hh, true);
+    addBound(gl, gl->m_groundLayer2, cy, hh, false);
+    R.r.ticks.push_back({cx, cy, hh, (uint8_t)idx, (uint8_t)mini, (uint8_t)R.brk[idx], first, (uint32_t)R.r.obs.size() - first});
     R.brk[idx] = false;
     R.has[idx] = true;
     R.lx[idx] = cx, R.ly[idx] = cy, R.mini[idx] = mini;
+}
+
+void onInput(GJBaseGameLayer* gl, bool down, int button, bool p1) {
+    if (g_test.on || !opt<bool>("record")) return;
+    if (g_rec.layer != gl) collect(gl);
+    auto pl = p1 ? gl->m_player1 : gl->m_player2;
+    if (pl) g_rec.r.inputs.push_back({pl->getPositionX(), (uint8_t)down, (uint8_t)button, (uint8_t)!p1});
+}
+
+// Plays the recorded clicks back by x (x does not depend on inputs, so this is tick exact).
+void replayStep(GJBaseGameLayer* gl) {
+    auto& T = g_test;
+    float px = gl->m_player1->getPositionX();
+    if (!T.started) {
+        T.started = true;
+        while (T.next < T.in.size() && T.in[T.next].x < px - 1) T.next++;
+    }
+    while (T.next < T.in.size() && T.in[T.next].x <= px + .01f) {
+        auto e = T.in[T.next++];
+        gl->handleButton(e.down, e.button, !e.p2);
+    }
+    if (!T.failed && !T.done && px > T.endX) {
+        T.done = true;
+        stopTestLater();
+    }
 }
 
 }
@@ -325,14 +465,18 @@ class $modify(SlopUI, EditorUI) {
         Trace* trace = nullptr;
         bool active = false;
         int mods = -1;
+        CCLayerColor* bar = nullptr;
         CCDrawNode* view = nullptr;
         CCLabelBMFont* status = nullptr;
+        float btnW = 0;
+        slop::Route route;
         std::vector<slop::Section> secs;
-        std::vector<std::vector<slop::Piece>> pcs;
         std::vector<double> margin;
-        std::vector<Ref<CCArray>> placed;
+        std::vector<char> applied;
+        std::vector<int> risk;
         int cur = 0;
         bool shown = true;
+        std::string test;
     };
 
     CCPoint toLevel(CCTouch* t) { return m_editorLayer->m_objectLayer->convertToNodeSpace(t->getLocation()); }
@@ -354,7 +498,7 @@ class $modify(SlopUI, EditorUI) {
         return o;
     }
 
-    // Whichever changed since the last stroke wins: build-tab button or a selected slope.
+    // Whichever changed since the last use wins: build-tab button or a selected slope.
     void pickTemplate() {
         GameObject* sel = m_selectedObject;
         if (!sel && m_selectedObjects && m_selectedObjects->count() == 1)
@@ -406,8 +550,8 @@ class $modify(SlopUI, EditorUI) {
             if (p.fx) s += ",4,1";
             if (p.fy) s += ",5,1";
             if (p.rot) s += ",6," + std::to_string(p.rot);
-            if (sx != 1) std::snprintf(buf, sizeof buf, ",128,%.4f", sx), s += buf;
-            if (sy != 1) std::snprintf(buf, sizeof buf, ",129,%.4f", sy), s += buf;
+            if (std::abs(sx - 1) > 1e-4) std::snprintf(buf, sizeof buf, ",128,%.4f", sx), s += buf;
+            if (std::abs(sy - 1) > 1e-4) std::snprintf(buf, sizeof buf, ",129,%.4f", sy), s += buf;
             if (layer >= 0) s += ",20," + std::to_string(layer);
             s += extra;
             s += ';';
@@ -426,11 +570,12 @@ class $modify(SlopUI, EditorUI) {
     bool init(LevelEditorLayer* lel) {
         if (!EditorUI::init(lel)) return false;
         g_rec = {};
-        auto bar = CCLayerColor::create({0, 0, 0, 170}, 10, 18);
+        auto bar = CCLayerColor::create({0, 0, 0, 170}, 10, 34);
         bar->ignoreAnchorPointForPosition(false);
         bar->setAnchorPoint({.5f, 0});
         bar->setID("route-bar"_spr);
         addChild(bar, 100);
+        m_fields->bar = bar;
         auto menu = CCMenu::create();
         menu->setPosition({0, 0});
         bar->addChild(menu);
@@ -440,25 +585,25 @@ class $modify(SlopUI, EditorUI) {
             l->setScale(.6f);
             auto b = CCMenuItemSpriteExtra::create(l, this, sel);
             b->setPosition({x + b->getContentSize().width / 2, 9});
-            x += b->getContentSize().width + 8;
+            x += b->getContentSize().width + 9;
             menu->addChild(b);
         };
         add("<", menu_selector(SlopUI::onRoutePrev));
-        auto st = CCLabelBMFont::create("", "chatFont.fnt");
-        st->setScale(.6f);
-        st->setAnchorPoint({0, .5f});
-        st->setPosition({x, 9});
-        bar->addChild(st);
-        m_fields->status = st;
-        x += 105;
         add(">", menu_selector(SlopUI::onRouteNext));
         add("-", menu_selector(SlopUI::onRouteMinus));
         add("+", menu_selector(SlopUI::onRoutePlus));
-        add("Place", menu_selector(SlopUI::onRoutePlace));
+        add("Apply", menu_selector(SlopUI::onRouteApply));
         add("All", menu_selector(SlopUI::onRouteAll));
+        add("Test", menu_selector(SlopUI::onRouteTest));
         add("Hide", menu_selector(SlopUI::onRouteHide));
         add("Del", menu_selector(SlopUI::onRouteDel));
-        bar->setContentSize({x, 18});
+        m_fields->btnW = x;
+        auto st = CCLabelBMFont::create("", "chatFont.fnt");
+        st->setScale(.6f);
+        st->setAnchorPoint({0, .5f});
+        st->setPosition({5, 26});
+        bar->addChild(st);
+        m_fields->status = st;
         bar->setPosition({CCDirector::get()->getWinSize().width / 2, m_toolbarHeight + 4});
         auto view = CCDrawNode::create();
         view->setBlendFunc({GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA});
@@ -468,27 +613,48 @@ class $modify(SlopUI, EditorUI) {
         return true;
     }
 
+    slop::Params params(size_t i, bool haveTwo) {
+        slop::Params p;
+        p.window = opt<double>("window");
+        p.tol = opt<double>("fit-tol");
+        p.wallScale = opt<double>("wall-scale");
+        p.baseRight = opt<bool>("base-rises-right");
+        p.margin = i < m_fields->margin.size() ? m_fields->margin[i] : 0;
+        p.haveTwo = haveTwo;
+        return p;
+    }
+
     void loadSections() {
-        m_fields->secs = slop::sections(loadRoute(m_editorLayer->m_level), opt<double>("max-gap"));
+        m_fields->route = {};
+        readRoute(m_editorLayer->m_level, m_fields->route);
+        m_fields->secs = slop::split(m_fields->route);
         size_t n = m_fields->secs.size();
         m_fields->margin.assign(n, 0);
-        m_fields->placed.clear();
-        m_fields->placed.resize(n);
+        m_fields->applied.assign(n, 0);
+        m_fields->risk.assign(n, 0);
         m_fields->cur = std::clamp(m_fields->cur, 0, std::max(0, (int)n - 1));
         g_routeDirty = false;
-        // the family is only known once probed in the level; assume a 2x1 exists until then
-        auto it = g_fam.find(g_tpl.id);
-        bool two = it == g_fam.end() || it->second.two;
-        m_fields->pcs.assign(n, {});
-        for (size_t i = 0; i < n; i++) slop::walls(m_fields->secs[i], 0, two, opt<bool>("base-rises-right"), m_fields->pcs[i]);
+        bool two = twoGuess();
+        for (size_t i = 0; i < n; i++) slop::solve(m_fields->route, m_fields->secs[i], params(i, two));
+        scanRisks();
         redrawRoute();
     }
 
-    bool isPlaced(size_t i) {
-        if (i >= m_fields->placed.size() || !m_fields->placed[i]) return false;
-        for (auto o : CCArrayExt<GameObject*>(m_fields->placed[i].data()))
-            if (o->getParent()) return true;
-        return false;
+    // Things that can make the timing depend on the path itself: speed / teleport portals,
+    // collision blocks, touch triggered triggers.
+    void scanRisks() {
+        static const std::unordered_set<int> ids{200, 201, 202, 203, 1334, 747, 1816};
+        auto& secs = m_fields->secs;
+        if (secs.empty()) return;
+        for (auto o : CCArrayExt<GameObject*>(m_editorLayer->m_objects)) {
+            bool risky = ids.count(o->m_objectID) > 0;
+            if (!risky)
+                if (auto e = typeinfo_cast<EffectGameObject*>(o)) risky = e->m_isTouchTriggered;
+            if (!risky) continue;
+            float x = o->getPositionX();
+            for (size_t i = 0; i < secs.size(); i++)
+                if (x >= secs[i].x0 - 30 && x <= secs[i].x1 + 30) m_fields->risk[i]++;
+        }
     }
 
     void redrawRoute() {
@@ -496,35 +662,67 @@ class $modify(SlopUI, EditorUI) {
         if (!v) return;
         v->clear();
         auto const& secs = m_fields->secs;
+        auto const& r = m_fields->route;
         int cur = m_fields->cur;
         if (m_fields->shown) {
             for (size_t i = 0; i < secs.size(); i++) {
+                auto const& s = secs[i];
                 bool on = (int)i == cur;
-                auto const& P = secs[i].path;
-                for (size_t j = 1; j < P.size(); j++)
-                    v->drawSegment(ccp(P[j - 1].x, P[j - 1].y), ccp(P[j].x, P[j].y), .75f, {1, 1, 1, on ? .9f : .35f});
-                for (auto const& p : m_fields->pcs[i]) {
+                float a = on ? 1.f : .35f;
+                for (size_t j = 3; j < s.ti.size(); j += 3) {
+                    auto const& p0 = r.ticks[s.ti[j - 3]];
+                    auto const& p1 = r.ticks[s.ti[j]];
+                    v->drawSegment(ccp(p0.x, p0.y), ccp(p1.x, p1.y), .5f, {1, 1, 1, .6f * a});
+                }
+                for (auto const& p : s.pieces) {
                     CCPoint q[4];
-                    for (int k = 0; k < p.n; k++) q[k] = ccp(p.poly[k].x, p.poly[k].y);
+                    for (int k = 0; k < p.n; k++) q[k] = ccp((float)p.poly[k].x, (float)p.poly[k].y);
                     float t = (float)p.tight;
                     v->drawPolygon(q, p.n, {1, .25f + .75f * t, .25f + .75f * t, on ? .45f : .15f}, .5f, {1, 1, 1, on ? .6f : .2f});
                 }
+                for (auto const& b : s.bad) v->drawDot(ccp((float)b.x, (float)b.y), 3.f, {1, 0, 1, .9f * a});
+                for (size_t c = 0; c < s.clicks.size(); c++) {
+                    auto const& t = r.ticks[s.ti[s.clicks[c]]];
+                    int w = s.winLo[c] + s.winHi[c];
+                    ccColor4F col = w <= 1 ? ccColor4F{1, .2f, .2f, a} : w <= 3 ? ccColor4F{1, .65f, .1f, a} : ccColor4F{1, 1, 1, .7f * a};
+                    v->drawDot(ccp(t.x, t.y), 2.2f, col);
+                    if (s.winLo[c] != s.genLo[c] || s.winHi[c] != s.genHi[c]) v->drawDot(ccp(t.x, t.y + 7), 1.6f, {1, 0, 1, a});
+                }
             }
         }
-        std::string s = "no route";
+        std::string st = "no route - play the level (bot / noclip) to record";
         if (!secs.empty()) {
-            auto const& sec = secs[cur];
+            auto const& s = secs[cur];
+            int diff = 0, tight = 0;
+            for (size_t c = 0; c < s.clicks.size(); c++) {
+                diff += s.winLo[c] != s.genLo[c] || s.winHi[c] != s.genHi[c];
+                tight += s.winLo[c] + s.winHi[c] <= 1;
+            }
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "%d/%d %s%s  match %.1f%%  clicks %d  tight %d", cur + 1, (int)secs.size(), s.mini ? "mini" : "big",
+                          s.p ? " p2" : "", s.score, (int)s.clicks.size(), tight);
+            st = buf;
+            if (diff) st += "  diff " + std::to_string(diff);
             int m = (int)m_fields->margin[cur];
-            s = std::to_string(cur + 1) + "/" + std::to_string(secs.size()) + (sec.mini ? " mini" : " big") + (sec.p ? " p2" : "") +
-                " gap " + (m >= 0 ? "+" : "") + std::to_string(m) + (isPlaced(cur) ? " ok" : "");
+            if (m) st += std::string("  gap ") + (m > 0 ? "+" : "") + std::to_string(m);
+            if (s.fHaz < .995 || s.fSolid < .995) {
+                std::snprintf(buf, sizeof buf, "  hitbox x%.2f", std::min(s.fHaz, s.fSolid));
+                st += buf;
+            }
+            if (m_fields->risk[cur]) st += "  ~" + std::to_string(m_fields->risk[cur]) + " path-dependent";
+            if (s.anomalies) st += "  !" + std::to_string(s.anomalies) + " through objects";
+            if (m_fields->applied[cur]) st += "  applied";
         }
-        m_fields->status->setString(s.c_str());
+        if (!m_fields->test.empty()) st += "  |  " + m_fields->test;
+        m_fields->status->setString(st.c_str());
+        float w = std::max(m_fields->btnW, m_fields->status->getScaledContentSize().width + 10);
+        m_fields->bar->setContentSize({w, 34});
     }
 
     void go(int d) {
         if (g_routeDirty) loadSections();
         int n = (int)m_fields->secs.size();
-        if (!n) return;
+        if (!n) return redrawRoute();
         m_fields->cur = ((m_fields->cur + d) % n + n) % n;
         auto c = m_fields->secs[m_fields->cur].mid;
         auto ol = m_editorLayer->m_objectLayer;
@@ -534,26 +732,64 @@ class $modify(SlopUI, EditorUI) {
     }
 
     void adjust(double d) {
-        int i = m_fields->cur;
         if (g_routeDirty || m_fields->secs.empty()) return go(0);
-        m_fields->margin[i] = std::clamp(m_fields->margin[i] + d, -30.0, 300.0);
-        auto it = g_fam.find(g_tpl.id);
-        m_fields->pcs[i].clear();
-        slop::walls(m_fields->secs[i], m_fields->margin[i], it == g_fam.end() || it->second.two, opt<bool>("base-rises-right"), m_fields->pcs[i]);
+        int i = m_fields->cur;
+        m_fields->margin[i] = std::clamp(m_fields->margin[i] + d, -20.0, 60.0);
+        slop::solve(m_fields->route, m_fields->secs[i], params(i, twoGuess()));
         redrawRoute();
     }
 
-    void placeSection(size_t i) {
+    // Replaces one wave part: objects that ever reached the wave's column there (and deco around
+    // it) are deleted, the slope version is placed. Two undo steps.
+    bool applySection(size_t i) {
         pickTemplate();
         auto fam = family(m_editorLayer, g_tpl.id);
         if (!fam.one && !fam.two) {
-            Notification::create("slop: pick a slope in the build tab", NotificationIcon::Warning)->show();
-            return;
+            notify("slop: pick a slope in the build tab", NotificationIcon::Warning);
+            return false;
         }
-        std::vector<slop::Piece> ps;
-        slop::walls(m_fields->secs[i], m_fields->margin[i], fam.two != 0, opt<bool>("base-rises-right"), ps);
-        m_fields->pcs[i] = ps;
-        if (auto arr = place(ps)) m_fields->placed[i] = arr;
+        auto& s = m_fields->secs[i];
+        auto const& r = m_fields->route;
+        slop::solve(r, s, params(i, fam.two != 0));
+        std::set<std::tuple<int, long, long>> keys;
+        for (auto c : s.cands) {
+            auto const& k = r.cands[c];
+            keys.insert(std::make_tuple(k.id, std::lround(k.x * 4), std::lround(k.y * 4)));
+        }
+        double ylo = 1e18, yhi = -1e18;
+        for (auto const& c : s.chan) ylo = std::min(ylo, c.lo), yhi = std::max(yhi, c.hi);
+        ylo -= 90, yhi += 90;
+        bool deco = opt<bool>("clean-deco");
+        auto del = CCArray::create();
+        int kept = 0, matched = 0;
+        for (auto o : CCArrayExt<GameObject*>(m_editorLayer->m_objects)) {
+            if (o->m_isTrigger || typeinfo_cast<EffectGameObject*>(o)) continue;
+            auto t = o->m_objectType;
+            auto p = o->getPosition();
+            if (t == GameObjectType::Solid || t == GameObjectType::Hazard || t == GameObjectType::Slope) {
+                if (!keys.count(std::make_tuple(o->m_objectID, std::lround(p.x * 4), std::lround(p.y * 4)))) continue;
+                matched++;
+                auto const& b = o->getObjectRect();
+                if (b.getMinX() < s.x0 - 45 || b.getMaxX() > s.x1 + 45) {
+                    kept++;
+                    continue;
+                }
+                del->addObject(o);
+            } else if (deco && (o->m_isDecoration || t == GameObjectType::Decoration)) {
+                if (p.x >= s.x0 && p.x <= s.x1 && p.y >= ylo && p.y <= yhi) del->addObject(o);
+            }
+        }
+        deselectAll();
+        if (del->count()) {
+            m_editorLayer->addToUndoList(UndoObject::createWithArray(del, UndoCommand::DeleteMulti), false);
+            for (auto o : CCArrayExt<GameObject*>(del)) m_editorLayer->removeObject(o, true);
+        }
+        auto placed = place(s.pieces);
+        m_fields->applied[i] = 1;
+        log::info("apply part {}: {} of {} objects matched, {} removed, {} kept (reach outside), {} placed", i + 1, matched, keys.size(),
+                  del->count(), kept, placed ? placed->count() : 0);
+        if (keys.size() && !matched) notify("slop: recorded objects not found in this level", NotificationIcon::Warning);
+        return true;
     }
 
     void onRoutePrev(CCObject*) { go(-1); }
@@ -561,17 +797,35 @@ class $modify(SlopUI, EditorUI) {
     void onRouteMinus(CCObject*) { adjust(-2); }
     void onRoutePlus(CCObject*) { adjust(2); }
 
-    void onRoutePlace(CCObject*) {
+    void onRouteApply(CCObject*) {
         if (g_routeDirty || m_fields->secs.empty()) return go(0);
-        placeSection(m_fields->cur);
+        applySection(m_fields->cur);
         redrawRoute();
     }
 
     void onRouteAll(CCObject*) {
         if (g_routeDirty || m_fields->secs.empty()) return go(0);
         for (size_t i = 0; i < m_fields->secs.size(); i++)
-            if (!isPlaced(i)) placeSection(i);
+            if (!m_fields->applied[i] && !applySection(i)) break;
         redrawRoute();
+    }
+
+    void onRouteTest(CCObject*) {
+        if (g_routeDirty) loadSections();
+        auto const& r = m_fields->route;
+        if (r.inputs.empty() || r.ticks.empty()) return notify("slop: the route has no recorded clicks", NotificationIcon::Warning);
+        if (m_editorLayer->m_playbackMode != PlaybackMode::Not) return;
+        g_test = {};
+        g_test.on = true;
+        g_test.in = r.inputs;
+        float mx = -1e9f;
+        for (auto const& t : r.ticks) mx = std::max(mx, t.x);
+        g_test.endX = mx + 30;
+        for (auto const& s : m_fields->secs) g_test.f = std::min(g_test.f, s.fHaz);
+        g_test.ui = this;
+        m_fields->test = "testing";
+        redrawRoute();
+        onPlaytest(nullptr);
     }
 
     void onRouteHide(CCObject*) {
@@ -582,22 +836,40 @@ class $modify(SlopUI, EditorUI) {
     void onRouteDel(CCObject*) {
         std::error_code ec;
         std::filesystem::remove(routeFile(m_editorLayer->m_level), ec);
+        m_fields->test.clear();
         loadSections();
     }
 
     void onStopPlaytest(CCObject* sender) {
+        bool wasTest = g_test.on;
         EditorUI::onStopPlaytest(sender);
-        if (g_routeDirty) loadSections();
+        if (wasTest) {
+            g_test.on = false;
+            std::string res = g_test.done ? "test passed" : "test stopped";
+            if (g_test.failed) {
+                res = "test: died at x " + std::to_string((int)g_test.failX);
+                for (size_t i = 0; i < m_fields->secs.size(); i++)
+                    if (g_test.failX >= m_fields->secs[i].x0 - 30 && g_test.failX <= m_fields->secs[i].x1 + 30)
+                        res = "test: died in part " + std::to_string(i + 1);
+            }
+            m_fields->test = res;
+            notify("slop: " + res, g_test.failed ? NotificationIcon::Error : NotificationIcon::Success);
+            redrawRoute();
+        } else if (g_routeDirty) {
+            loadSections();
+        }
     }
+
+    // ---- drawing -------------------------------------------------------------
 
     bool ccTouchBegan(CCTouch* t, CCEvent* e) {
         if (!opt<bool>("enabled") || !held(kCtrl) || m_editorLayer->m_playbackMode != PlaybackMode::Not ||
-            t->getLocation().y < m_toolbarHeight)
+            t->getLocation().y < m_toolbarHeight + 38)
             return EditorUI::ccTouchBegan(t, e);
         pickTemplate();
         m_fields->active = true;
         if (auto fam = family(m_editorLayer, g_tpl.id); !fam.one && !fam.two) {
-            Notification::create("slop: pick a slope in the build tab", NotificationIcon::Warning)->show();
+            notify("slop: pick a slope in the build tab", NotificationIcon::Warning);
             return true;
         }
         auto tr = Trace::create();
@@ -645,6 +917,23 @@ class $modify(SlopGame, GJBaseGameLayer) {
         sample(this, p, p == m_player2 ? 1 : 0);
         return r;
     }
+
+    void handleButton(bool down, int button, bool isPlayer1) {
+        onInput(this, down, button, isPlayer1);
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        if (g_test.on && m_player1 && typeinfo_cast<LevelEditorLayer*>(this)) replayStep(this);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+    }
+};
+
+class $modify(SlopPlayer, PlayerObject) {
+    void playerDestroyed(bool noEffects) {
+        if (g_test.on) testFail(getPositionX());
+        PlayerObject::playerDestroyed(noEffects);
+    }
 };
 
 class $modify(SlopPlay, PlayLayer) {
@@ -667,7 +956,7 @@ class $modify(SlopEditor, LevelEditorLayer) {
     }
 
     void onStopPlaytest() {
-        saveRoute(m_level);
+        if (!g_test.on) saveRoute(m_level);
         g_rec = {};
         LevelEditorLayer::onStopPlaytest();
     }

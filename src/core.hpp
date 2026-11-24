@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 // Geode-free geometry: strokes and recorded wave routes -> slope pieces.
@@ -21,9 +22,11 @@ struct Piece {
     double sx = 1, sy = 1;
     bool ceil = false;
     double tight = 1;   // preview color: 0 = no room, 1 = roomy
-    V poly[4];          // outline for preview
+    V poly[4];          // outline, level units
     int n = 0;
 };
+
+// ---- drawing --------------------------------------------------------------------
 
 struct Opts {
     double eps = 10;       // simplify tolerance, level units
@@ -37,31 +40,78 @@ struct Opts {
     std::size_t maxPieces = 600;
 };
 
-// One physics step of a wave player.
-struct Sample {
-    float x = 0, y = 0, hh = 0; // hitbox center, half height
-    float up = 0, down = 0;     // free space above / below the hitbox at that moment
-    unsigned char p = 0, mini = 0, brk = 0;
-};
-
-// One continuous wave part of the route.
-struct Section {
-    int p = 0;
-    bool mini = false;
-    std::vector<V> path;        // simplified path
-    std::vector<double> lo, hi; // per path segment: distance from path to floor / ceiling wall
-    double hh = 0;
-    V mid;
-};
-
 std::vector<std::size_t> simplifyIdx(std::vector<V> const& pts, double eps);
 std::vector<V> simplify(std::vector<V> const& pts, double eps);
 std::vector<Piece> build(std::vector<V> const& pts, Opts const& o);
 
-std::vector<Section> sections(std::vector<Sample> const& s, double maxGap);
-void walls(Section const& sec, double margin, bool haveTwo, bool baseRight, std::vector<Piece>& out);
+// ---- recorded routes ------------------------------------------------------------
 
+// Something that can kill or block the wave, as its vertical extent over the hitbox width
+// at one physics step. type: 0 hazard, 1 solid, 2 slope, 3 ground/ceiling.
+struct Obstacle {
+    float lo, hi;
+    std::uint8_t type;
+    std::int32_t cand;
+};
+
+struct Tick {
+    float x, y, hh; // hitbox center, half size
+    std::uint8_t p, mini, brk;
+    std::uint32_t first, count; // obstacles
+};
+
+struct Input {
+    float x;        // player x when the button changed (x does not depend on inputs)
+    std::uint8_t down, button, p2;
+};
+
+struct Cand {
+    std::int32_t id;
+    float x, y;     // start position
+};
+
+struct Route {
+    std::vector<Tick> ticks;
+    std::vector<Obstacle> obs;
+    std::vector<Input> inputs;
+    std::vector<Cand> cands;
+};
+
+struct Interval {
+    double lo, hi;
+};
+
+struct Params {
+    double window = 300;   // free space considered above/below the path
+    double tol = .75;      // boundary fit tolerance
+    double wallScale = 1;  // wall distance = hitbox half size * this
+    double margin = 0;     // manual gap tweak per section
+    bool haveTwo = true, baseRight = true;
+};
+
+struct Section {
+    int p = 0;
+    bool mini = false;
+    std::vector<std::size_t> ti;     // ticks of this section
+    double x0 = 0, x1 = 0;
+    V mid;
+    // results
+    double fHaz = 1, fSolid = 1;     // hitbox calibration from the bot path
+    int anomalies = 0;               // ticks where the path went through something
+    std::vector<Interval> chan;      // per tick: where the wave center can be and still finish
+    std::vector<Piece> pieces;
+    double score = 0;                // % of ticks where the slope version gives the same room
+    std::vector<V> bad;              // mismatching spots
+    std::vector<int> clicks;         // tick index of each click
+    std::vector<int> winLo, winHi;   // ticks a click can be early / late, original
+    std::vector<int> genLo, genHi;   // same on the slope version
+    std::vector<std::int32_t> cands; // objects that touched the wave's column
+};
+
+std::vector<Section> split(Route const& r);
+void solve(Route const& r, Section& s, Params const& prm);
+
+bool spanOver(V const* poly, int n, double x0, double x1, double& lo, double& hi);
 void slopeTri(double cx, double cy, double w, double h, bool fx, bool fy, int rot, bool baseRight, V out[3]);
-void clearance(V const* poly, int n, double x0, double x1, double y0, double y1, double& up, double& down);
 
 }
