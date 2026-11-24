@@ -301,11 +301,47 @@ std::filesystem::path externalFile(GJGameLevel* level) {
     return p;
 }
 
-bool readRoute(GJGameLevel* level, slop::Route& r) {
-    std::ifstream f(routeRead(level), std::ios::binary);
+bool readRouteFile(std::filesystem::path const& path, slop::Route& r) {
+    std::ifstream f(path, std::ios::binary);
     char magic[4];
     if (!f.read(magic, 4) || std::memcmp(magic, "SLP2", 4)) return false;
     return getVec(f, r.ticks) && getVec(f, r.obs) && getVec(f, r.inputs) && getVec(f, r.cands);
+}
+
+bool readRoute(GJGameLevel* level, slop::Route& r) { return readRouteFile(routeRead(level), r); }
+
+// Same level (and same object list, so obstacle -> object indices stay valid).
+bool sameLevel(slop::Route const& a, slop::Route const& b) {
+    if (a.cands.size() != b.cands.size()) return false;
+    if (a.cands.empty()) return true;
+    auto eq = [](slop::Cand const& p, slop::Cand const& q) { return p.id == q.id && std::abs(p.x - q.x) < .01f && std::abs(p.y - q.y) < .01f; };
+    return eq(a.cands.front(), b.cands.front()) && eq(a.cands.back(), b.cands.back());
+}
+
+// The old route outside [a, b] + the new run inside it.
+slop::Route mergeRoute(slop::Route const& old, slop::Route const& run, float a, float b) {
+    slop::Route o;
+    o.cands = run.cands;
+    auto add = [&](slop::Route const& src, slop::Tick t, bool brk) {
+        uint32_t first = (uint32_t)o.obs.size();
+        for (uint32_t q = t.first; q < t.first + t.count; q++) o.obs.push_back(src.obs[q]);
+        t.first = first;
+        if (brk) t.brk = 1;
+        o.ticks.push_back(t);
+    };
+    bool first[2] = {true, true};
+    for (auto const& t : old.ticks)
+        if (t.x < a) add(old, t, false);
+    for (auto const& t : run.ticks) add(run, t, first[t.p]), first[t.p] = false;
+    first[0] = first[1] = true;
+    for (auto const& t : old.ticks)
+        if (t.x > b) add(old, t, first[t.p]), first[t.p] = false;
+    for (auto const& e : old.inputs)
+        if (e.x < a) o.inputs.push_back(e);
+    for (auto const& e : run.inputs) o.inputs.push_back(e);
+    for (auto const& e : old.inputs)
+        if (e.x > b) o.inputs.push_back(e);
+    return o;
 }
 
 // Set by Apply: runs on that level are runs on the slope version, kept apart from its route.
@@ -330,27 +366,37 @@ void clearRun() {
     g_rec.r.inputs.clear();
 }
 
-void saveRoute(GJGameLevel* level) {
+void truncate(float x);
+
+// Never refuses a run: a full run replaces the route (old one kept as .prev.bin), an unfinished
+// run of the same level only replaces the stretch it covers.
+void saveRoute(GJGameLevel* level, bool complete) {
     auto& r = g_rec.r;
+    if (!complete && r.ticks.size() > 48) truncate(r.ticks[r.ticks.size() - 24].x); // may end in the crash
     if (r.ticks.empty()) return;
-    float mx = -1e9f;
-    for (auto& t : r.ticks) mx = std::max(mx, t.x);
-    auto path = routeFile(level);
+    float a = 1e9f, b = -1e9f;
+    for (auto& t : r.ticks) a = std::min(a, t.x), b = std::max(b, t.x);
+    auto path = routeFile(level); // own file only, never the original's a copy falls back to
     bool slopeRun = std::filesystem::exists(appliedMark(level));
+    if (slopeRun) path.replace_extension(".slope.bin");
     slop::Route old;
-    if (slopeRun) {
-        path.replace_extension(".slope.bin");
-    } else if (readRoute(level, old)) {
+    bool merged = false;
+    if (readRouteFile(path, old) && sameLevel(old, r)) {
         float omx = -1e9f;
         for (auto& t : old.ticks) omx = std::max(omx, t.x);
-        if (omx > mx + 30) {
-            notify("slop: shorter run, the old route is kept", NotificationIcon::Warning);
-            clearRun();
-            return;
-        }
+        merged = b < omx - 30;
     }
-    writeRoute(path, r);
+    std::error_code ec;
+    if (std::filesystem::exists(path)) {
+        auto prev = path;
+        prev.replace_extension(".prev.bin");
+        std::filesystem::copy_file(path, prev, std::filesystem::copy_options::overwrite_existing, ec);
+    }
+    auto const& out = merged ? mergeRoute(old, r, a, b) : r;
+    writeRoute(path, out);
     if (slopeRun) notify("slop: run on the slope version saved apart (" + path.filename().string() + ")", NotificationIcon::Info);
+    else if (merged)
+        notify("slop: re-recorded x " + std::to_string((int)a) + "-" + std::to_string((int)b) + ", rest of the route kept", NotificationIcon::Success);
     else
         notify("slop: route saved, " + std::to_string(slop::split(r).size()) + " wave parts, " + std::to_string(r.inputs.size()) + " clicks",
                NotificationIcon::Success);
@@ -1044,11 +1090,11 @@ class $modify(SlopPlayer, PlayerObject) {
 class $modify(SlopPlay, PlayLayer) {
     void levelComplete() {
         PlayLayer::levelComplete();
-        saveRoute(m_level);
+        saveRoute(m_level, true);
     }
 
     void onQuit() {
-        saveRoute(m_level);
+        saveRoute(m_level, false);
         g_rec = {};
         PlayLayer::onQuit();
     }
@@ -1061,7 +1107,7 @@ class $modify(SlopEditor, LevelEditorLayer) {
     }
 
     void onStopPlaytest() {
-        if (!g_test.on) saveRoute(m_level);
+        if (!g_test.on) saveRoute(m_level, false);
         g_rec = {};
         LevelEditorLayer::onStopPlaytest();
     }

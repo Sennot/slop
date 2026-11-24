@@ -22,6 +22,9 @@ do not re-derive what is written here, do not start unasked changes.
   (non-alnum -> `_`). A copy `Name 2` / `Name copy` falls back to `Name.bin` if it has none.
   `<name>.pieces.txt` next to the route = offline pieces (see below). `<name>.applied` = Apply was
   used on that level; later runs on it are saved to `<name>.slope.bin` instead (never over the route).
+  Saving never refuses: a full run replaces the route (previous -> `<name>.prev.bin`), an unfinished
+  run of the same level (same object list) replaces only the x stretch it covers, minus its last 0.1 s.
+  Saving only compares with the level's own file, never the copy fallback.
 - Game log: `D:\SteamLibrary\steamapps\common\Geometry Dash\geode\logs\` — lines `[slop]`:
   `route saved: N ticks…`, `apply part i: matched/removed/placed`, `template id (one/two)`.
 - `src/core.*` — all geometry, Geode-free. `src/main.cpp` — hooks, recorder, editor bar.
