@@ -1,0 +1,23 @@
+{
+	"geode": "5.10.1",
+	"gd": {
+		"win": "2.2081"
+	},
+	"id": "sennot.slop",
+	"name": "slop",
+	"version": "v0.1.0",
+	"developer": "Sennot",
+	"description": "Draw wave slopes in the editor with Ctrl + drag",
+	"settings": {
+		"enabled": { "type": "bool", "name": "Enabled", "default": true },
+		"wave": { "type": "string", "name": "Wave", "default": "Auto", "one-of": ["Auto", "Big", "Mini"] },
+		"corridor-gap": { "type": "float", "name": "Corridor gap", "default": 30, "min": 5, "max": 600 },
+		"smoothing": { "type": "float", "name": "Smoothing (px)", "default": 12, "min": 1, "max": 80 },
+		"start-snap": { "type": "float", "name": "Start snap (0 = free)", "default": 0, "min": 0, "max": 30 },
+		"flat-block-id": { "type": "int", "name": "Flat block ID", "default": 1, "min": 1, "max": 10000 },
+		"max-pieces": { "type": "int", "name": "Max pieces per stroke", "default": 600, "min": 10, "max": 5000 },
+		"trace-color": { "type": "rgba", "name": "Trace color", "default": [255, 255, 255, 230] },
+		"trace-width": { "type": "float", "name": "Trace width (px)", "default": 2.5, "min": 0.5, "max": 10 },
+		"base-rises-right": { "type": "bool", "name": "Unrotated slope rises right", "default": true }
+	}
+}
