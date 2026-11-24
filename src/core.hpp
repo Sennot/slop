@@ -83,7 +83,7 @@ struct Interval {
 
 struct Params {
     double window = 300;   // free space considered above/below the path
-    double tol = .75;      // boundary fit tolerance
+    double tol = .5;       // boundary fit tolerance
     double wallScale = 1;  // wall distance = hitbox half size * this
     double margin = 0;     // manual gap tweak per section
     bool haveTwo = true, baseRight = true;
@@ -99,6 +99,7 @@ struct Section {
     double fHaz = 1, fSolid = 1;     // hitbox calibration from the bot path
     int anomalies = 0;               // ticks where the path went through something
     std::vector<Interval> chan;      // per tick: where the wave center can be and still finish
+    std::vector<Interval> chan2;     // the same on the slope version
     std::vector<Piece> pieces;
     double score = 0;                // % of ticks where the slope version gives the same room
     std::vector<V> bad;              // mismatching spots
@@ -111,6 +112,7 @@ struct Section {
 std::vector<Section> split(Route const& r);
 void solve(Route const& r, Section& s, Params const& prm);
 
+constexpr int kMaxPoly = 16; // convex polygon vertices (circles are 16-gons)
 bool spanOver(V const* poly, int n, double x0, double x1, double& lo, double& hi);
 void slopeTri(double cx, double cy, double w, double h, bool fx, bool fy, int rot, bool baseRight, V out[3]);
 

@@ -278,7 +278,18 @@ bool getVec(std::ifstream& f, std::vector<T>& v) {
 }
 
 bool readRoute(GJGameLevel* level, slop::Route& r) {
-    std::ifstream f(routeFile(level), std::ios::binary);
+    auto path = routeFile(level);
+    if (!std::filesystem::exists(path)) {
+        // a copy ("Name 2", "Name copy") falls back to the original's route
+        auto stem = path.stem().string();
+        auto cut = stem.find_last_of('_');
+        if (cut != std::string::npos && cut > 0) {
+            auto tail = stem.substr(cut + 1);
+            bool num = !tail.empty() && std::all_of(tail.begin(), tail.end(), [](char c) { return std::isdigit((unsigned char)c); });
+            if (num || tail == "copy" || tail == "Copy") path.replace_filename(stem.substr(0, cut) + ".bin");
+        }
+    }
+    std::ifstream f(path, std::ios::binary);
     char magic[4];
     if (!f.read(magic, 4) || std::memcmp(magic, "SLP2", 4)) return false;
     return getVec(f, r.ticks) && getVec(f, r.obs) && getVec(f, r.inputs) && getVec(f, r.cands);
@@ -333,8 +344,15 @@ void collect(GJBaseGameLayer* gl) {
     }
 }
 
-// Hitbox shape of an object right now: slope triangle, rotated box or plain rect.
+// Hitbox shape of an object right now: circle (saws), slope triangle, rotated box or plain rect.
 int polyOf(GameObject* o, CCRect const& b, bool baseRight, slop::V* poly) {
+    if (float rad = o->getObjectRadius(); rad > 0) {
+        for (int i = 0; i < slop::kMaxPoly; i++) {
+            double a = i * 6.283185307179586 / slop::kMaxPoly;
+            poly[i] = {b.getMidX() + rad * std::cos(a), b.getMidY() + rad * std::sin(a)};
+        }
+        return slop::kMaxPoly;
+    }
     float rot = o->getRotation(), m90 = std::fmod(std::abs(rot), 90.f);
     if (o->m_objectType == GameObjectType::Slope) {
         int r90 = ((int)std::lround(rot / 90) % 4 + 4) % 4;
@@ -386,10 +404,16 @@ void testFail(float x) {
 
 // One physics step of one player: the wave hitbox and every obstacle in its column as it is
 // right now (moved, rotated, toggled - whatever the triggers did).
+// Editor playtests are not recorded unless asked: playtesting an applied copy would
+// overwrite the route of the original.
+bool recording(GJBaseGameLayer* gl) {
+    return opt<bool>("record") && (!typeinfo_cast<LevelEditorLayer*>(gl) || opt<bool>("record-editor"));
+}
+
 void sample(GJBaseGameLayer* gl, PlayerObject* pl, int idx) {
     if (!pl) return;
     bool testing = g_test.on;
-    if (!testing && !opt<bool>("record")) return;
+    if (!testing && !recording(gl)) return;
     if (g_rec.layer != gl) collect(gl);
     auto& R = g_rec;
     if (!pl->m_isDart) {
@@ -413,7 +437,7 @@ void sample(GJBaseGameLayer* gl, PlayerObject* pl, int idx) {
         if (o->m_isGroupDisabled || o->m_isDisabled || o->m_isNoTouch || o->m_isPassable) continue;
         auto const& b = o->getObjectRect();
         if (b.getMaxX() < x0 || b.getMinX() > x1 || b.getMinY() > cy + win || b.getMaxY() < cy - win) continue;
-        slop::V poly[4];
+        slop::V poly[slop::kMaxPoly];
         int n = polyOf(o, b, baseRight, poly);
         double lo, hi;
         if (!slop::spanOver(poly, n, x0, x1, lo, hi)) continue;
@@ -434,7 +458,7 @@ void sample(GJBaseGameLayer* gl, PlayerObject* pl, int idx) {
 }
 
 void onInput(GJBaseGameLayer* gl, bool down, int button, bool p1) {
-    if (g_test.on || !opt<bool>("record")) return;
+    if (g_test.on || !recording(gl)) return;
     if (g_rec.layer != gl) collect(gl);
     auto pl = p1 ? gl->m_player1 : gl->m_player2;
     if (pl) g_rec.r.inputs.push_back({pl->getPositionX(), (uint8_t)down, (uint8_t)button, (uint8_t)!p1});

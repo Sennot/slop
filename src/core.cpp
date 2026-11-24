@@ -1,6 +1,7 @@
 #include "core.hpp"
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #include <utility>
 
 namespace slop {
@@ -188,7 +189,7 @@ static bool spanAt(V const* p, int n, double x, double& lo, double& hi) {
 // Vertical extent of a convex polygon over the strip [x0, x1]: for a convex polygon the
 // extremes sit on the strip edges or at a vertex inside it.
 bool spanOver(V const* p, int n, double x0, double x1, double& lo, double& hi) {
-    double xs[6];
+    double xs[2 + kMaxPoly];
     int m = 0;
     xs[m++] = x0;
     xs[m++] = x1;
@@ -455,15 +456,17 @@ static std::vector<Interval> channel(Route const& r, Section const& s, std::vect
         if (j >= 0) o.push_back(v[j]);
         return o;
     };
+    // Only the tube the bot flies in: a parallel corridor that merges later must not widen it,
+    // the slope version will not have that corridor.
     std::vector<Ivs> R(n), C(n);
     R[0] = pick(F[0], T(0).y);
     for (std::size_t i = 1; i < n; i++) {
-        R[i] = meet(expand(R[i - 1], k * (T(i).x - T(i - 1).x)), F[i]);
+        R[i] = pick(meet(expand(R[i - 1], k * (T(i).x - T(i - 1).x)), F[i]), T(i).y);
         if (R[i].empty()) R[i] = pick(F[i], T(i).y);
     }
     C[n - 1] = pick(F[n - 1], T(n - 1).y);
     for (std::size_t i = n - 1; i > 0; i--) {
-        C[i - 1] = meet(expand(C[i], k * (T(i).x - T(i - 1).x)), F[i - 1]);
+        C[i - 1] = pick(meet(expand(C[i], k * (T(i).x - T(i - 1).x)), F[i - 1]), T(i - 1).y);
         if (C[i - 1].empty()) C[i - 1] = pick(F[i - 1], T(i - 1).y);
     }
     std::vector<Interval> ch(n);
@@ -508,46 +511,56 @@ void solve(Route const& r, Section& s, Params const& prm) {
     auto T = [&](std::size_t i) -> Tick const& { return r.ticks[s.ti[i]]; };
 
     // Hitbox calibration: the bot survived, so the real hitbox never overlapped anything.
-    double rh = 1e9, rs = 1e9;
-    s.anomalies = 0;
+    // One badly modelled object must not shrink the hitbox everywhere: use the closest approach
+    // per object and only follow a consistent trend (several objects), never single outliers.
+    std::unordered_map<std::int32_t, std::pair<double, int>> closest; // cand -> ratio, type
     s.cands.clear();
     for (std::size_t i = 0; i < n; i++) {
         auto const& t = T(i);
-        bool bad = false;
         for (std::uint32_t q = t.first; q < t.first + t.count; q++) {
             auto const& o = r.obs[q];
-            if (o.cand >= 0) s.cands.push_back(o.cand);
+            if (o.cand < 0) continue;
+            s.cands.push_back(o.cand);
             double d = t.y < o.lo ? o.lo - t.y : t.y > o.hi ? t.y - o.hi : 0;
             double f = d / std::max(.01f, t.hh);
-            if (f < .3) {
-                bad = true;
-                continue;
-            }
-            if (o.type == 0) rh = std::min(rh, f);
-            else rs = std::min(rs, f);
+            auto it = closest.find(o.cand);
+            if (it == closest.end()) closest[o.cand] = {f, o.type == 0 ? 0 : 1};
+            else it->second.first = std::min(it->second.first, f);
         }
-        s.anomalies += bad;
     }
     std::sort(s.cands.begin(), s.cands.end());
     s.cands.erase(std::unique(s.cands.begin(), s.cands.end()), s.cands.end());
-    s.fHaz = std::clamp(rh - .005, .3, 1.0);
-    s.fSolid = std::clamp(rs - .005, .3, 1.0);
+    auto calib = [&](int type) {
+        std::vector<double> v;
+        for (auto const& [c, rt] : closest)
+            if (rt.second == type && rt.first < 1) v.push_back(rt.first);
+        if (v.size() < 4) return 1.0;
+        std::sort(v.begin(), v.end());
+        return std::clamp(v[v.size() / 4] - .005, .5, 1.0);
+    };
+    s.fHaz = calib(0);
+    s.fSolid = calib(1);
 
-    // free space per tick
+    // free space per tick; whatever the bot provably flew through does not block at that tick
     std::vector<Ivs> F(n);
-    std::vector<double> w(n);
+    s.anomalies = 0;
     for (std::size_t i = 0; i < n; i++) {
         auto const& t = T(i);
         double eh = t.hh * s.fHaz, es = t.hh * s.fSolid;
         Ivs bl;
+        bool bad = false;
         for (std::uint32_t q = t.first; q < t.first + t.count; q++) {
             auto const& o = r.obs[q];
             double e = o.type == 0 ? eh : es;
+            if (t.y > o.lo - e + 1e-3 && t.y < o.hi + e - 1e-3) {
+                bad = true;
+                continue;
+            }
             bl.push_back({o.lo - e, o.hi + e});
         }
+        s.anomalies += bad;
         norm(bl);
         F[i] = complement(bl, t.y - prm.window, t.y + prm.window);
-        w[i] = es * prm.wallScale + prm.margin;
     }
     s.chan = channel(r, s, F);
 
@@ -601,10 +614,11 @@ void solve(Route const& r, Section& s, Params const& prm) {
         G[i] = complement(bl, t.y - prm.window, t.y + prm.window);
     }
     auto ch2 = channel(r, s, G);
+    s.chan2 = ch2;
     std::size_t ok = 0;
     s.bad.clear();
     for (std::size_t i = 0; i < n; i++) {
-        double tol = 1 + std::abs(prm.margin);
+        double tol = 1.5 + std::abs(prm.margin); // under one tick of wave travel
         bool good = (fo[i] || std::abs(ch2[i].lo - s.chan[i].lo) <= tol) && (co[i] || std::abs(ch2[i].hi - s.chan[i].hi) <= tol);
         ok += good;
         if (!good && (s.bad.empty() || T(i).x - s.bad.back().x > 6)) s.bad.push_back({T(i).x, T(i).y});
