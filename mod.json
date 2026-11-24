@@ -1,11 +1,11 @@
-{
+﻿{
 	"geode": "5.10.1",
 	"gd": {
 		"win": "2.2081"
 	},
 	"id": "sennot.slop",
 	"name": "slop",
-	"version": "v0.1.0",
+	"version": "v0.1.1",
 	"developer": "Sennot",
 	"description": "Draw wave slopes in the editor with Ctrl + drag",
 	"settings": {

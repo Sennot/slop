@@ -106,16 +106,27 @@ std::unordered_map<int, std::string> const& frames() {
     return f;
 }
 
-// 0 = not a slope, 1 = 1x1, 2 = 2x1
-int sizeClass(int id) {
+bool g_probed = false;
+CCPoint g_off; // node position of an object saved at (0, 0)
+
+// 0 = not a slope, 1 = 1x1, 2 = 2x1. Uses a real level object: createWithKey alone
+// does not set the object type.
+int sizeClass(LevelEditorLayer* lel, int id) {
     static std::unordered_map<int, int> cache;
     if (auto it = cache.find(id); it != cache.end()) return it->second;
     int c = 0;
-    if (frames().count(id)) {
-        if (auto o = GameObject::createWithKey(id); o && o->m_objectType == GameObjectType::Slope) {
+    if (id > 0 && frames().count(id)) {
+        auto a = lel->createObjectsFromString(("1," + std::to_string(id) + ",2,0,3,0").c_str(), true, true);
+        if (a && a->count()) {
+            auto o = static_cast<GameObject*>(a->objectAtIndex(0));
             auto s = o->getContentSize();
-            float r = s.height > 0 ? s.width / s.height : 0;
-            c = r > 1.5f ? 2 : r > .6f ? 1 : 0;
+            if (o->m_objectType == GameObjectType::Slope && s.height > 0) {
+                float r = s.width / s.height;
+                c = r > 1.5f ? 2 : r > .6f ? 1 : 0;
+            }
+            if (!g_probed) g_off = o->getPosition(), g_probed = true;
+            log::debug("id {} type {} size {}x{} -> {}", id, (int)o->m_objectType, s.width, s.height, c);
+            for (auto obj : CCArrayExt<GameObject*>(a)) lel->removeObject(obj, true);
         }
     }
     return cache[id] = c;
@@ -126,15 +137,15 @@ struct Family {
 };
 
 // The other size of the same block set: nearby id with the longest shared frame name.
-Family family(int id) {
+Family family(LevelEditorLayer* lel, int id) {
     static std::unordered_map<int, Family> cache;
     if (auto it = cache.find(id); it != cache.end()) return it->second;
-    int c = sizeClass(id);
+    int c = sizeClass(lel, id);
     if (!c) return cache[id] = {};
     auto const& name = frames().at(id);
     int best = 0, bestScore = -1;
     for (int d = -12; d <= 12; d++) {
-        if (!d || sizeClass(id + d) != 3 - c) continue;
+        if (!d || sizeClass(lel, id + d) != 3 - c) continue;
         auto const& other = frames().at(id + d);
         int pre = 0;
         while (pre < (int)name.size() && pre < (int)other.size() && name[pre] == other[pre]) pre++;
@@ -171,8 +182,6 @@ struct Template {
 Template g_tpl;
 int g_lastIndex = -1;
 void* g_lastSel = nullptr;
-bool g_probed = false;
-CCPoint g_off;
 
 }
 
@@ -197,7 +206,7 @@ class $modify(SlopUI, EditorUI) {
         o.gap = opt<double>("corridor-gap");
         o.snap = opt<double>("start-snap");
         o.baseRight = opt<bool>("base-rises-right");
-        o.rot63 = family(g_tpl.id).two != 0;
+        o.rot63 = family(m_editorLayer, g_tpl.id).two != 0;
         o.maxPieces = (size_t)opt<int64_t>("max-pieces");
         return o;
     }
@@ -209,13 +218,14 @@ class $modify(SlopUI, EditorUI) {
             sel = static_cast<GameObject*>(m_selectedObjects->objectAtIndex(0));
         if (sel != g_lastSel) {
             g_lastSel = sel;
-            if (sel && sizeClass(sel->m_objectID))
+            if (sel && sizeClass(m_editorLayer, sel->m_objectID))
                 g_tpl = {sel->m_objectID, std::string(sel->getSaveString(m_editorLayer).c_str())};
         }
         if (m_selectedObjectIndex != g_lastIndex) {
             g_lastIndex = m_selectedObjectIndex;
-            if (sizeClass(g_lastIndex)) g_tpl = {g_lastIndex, ""};
+            if (sizeClass(m_editorLayer, g_lastIndex)) g_tpl = {g_lastIndex, ""};
         }
+        log::debug("build tab {}, selected {}, template {}", m_selectedObjectIndex, sel ? sel->m_objectID : 0, g_tpl.id);
     }
 
     void refresh(bool force) {
@@ -234,17 +244,8 @@ class $modify(SlopUI, EditorUI) {
     }
 
     void place(std::vector<slop::Piece> const& ps) {
-        auto fam = family(g_tpl.id);
+        auto fam = family(m_editorLayer, g_tpl.id);
         if (ps.empty() || (!fam.one && !fam.two)) return;
-        if (!g_probed) {
-            // save-string coords vs node coords
-            if (auto a = m_editorLayer->createObjectsFromString("1,1,2,0,3,0", true, true); a && a->count()) {
-                auto o = static_cast<GameObject*>(a->objectAtIndex(0));
-                g_off = o->getPosition();
-                m_editorLayer->removeObject(o, true);
-                g_probed = true;
-            }
-        }
         int layer = m_editorLayer->m_currentLayer;
         auto extra = stripTemplate(g_tpl.save, layer >= 0);
         int flat = (int)opt<int64_t>("flat-block-id");
@@ -269,6 +270,8 @@ class $modify(SlopUI, EditorUI) {
             s += ';';
         }
         auto arr = m_editorLayer->createObjectsFromString(s.c_str(), true, true);
+        log::info("template {} ({}/{}), {} pieces -> {} objects, offset {},{}", g_tpl.id, fam.one, fam.two, ps.size(),
+                  arr ? arr->count() : 0, g_off.x, g_off.y);
         if (!arr || !arr->count()) return;
         m_editorLayer->addToUndoList(UndoObject::createWithArray(arr, UndoCommand::Paste), false);
         updateButtons();
@@ -279,13 +282,17 @@ class $modify(SlopUI, EditorUI) {
             t->getLocation().y < m_toolbarHeight)
             return EditorUI::ccTouchBegan(t, e);
         pickTemplate();
+        m_fields->active = true;
+        if (auto fam = family(m_editorLayer, g_tpl.id); !fam.one && !fam.two) {
+            Notification::create("slop: pick a slope in the build tab", NotificationIcon::Warning)->show();
+            return true;
+        }
         auto tr = Trace::create();
         m_editorLayer->m_objectLayer->addChild(tr, 9999);
         auto p = toLevel(t);
         tr->raw.push_back({p.x, p.y});
         tr->tick = [this] { refresh(false); };
         m_fields->trace = tr;
-        m_fields->active = true;
         m_fields->mods = -1;
         refresh(true);
         return true;
