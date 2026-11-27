@@ -521,6 +521,7 @@ void solve(Route const& r, Section& s, Params const& prm) {
             auto const& o = r.obs[q];
             if (o.cand < 0) continue;
             s.cands.push_back(o.cand);
+            if (o.type == 2) continue; // the wave may slide on slopes: touching them says nothing about the hitbox
             double d = t.y < o.lo ? o.lo - t.y : t.y > o.hi ? t.y - o.hi : 0;
             double f = d / std::max(.01f, t.hh);
             auto it = closest.find(o.cand);
@@ -553,7 +554,11 @@ void solve(Route const& r, Section& s, Params const& prm) {
             auto const& o = r.obs[q];
             double e = o.type == 0 ? eh : es;
             if (t.y > o.lo - e + 1e-3 && t.y < o.hi + e - 1e-3) {
-                bad = true;
+                // the bot was there (sliding on a slope, or a badly modelled object): the obstacle
+                // starts right at the path instead of vanishing, so the wall stays on it
+                bad |= o.type != 2;
+                if (o.lo + o.hi > 2 * t.y) bl.push_back({t.y + 1e-3, o.hi + e});
+                else bl.push_back({o.lo - e, t.y - 1e-3});
                 continue;
             }
             bl.push_back({o.lo - e, o.hi + e});
