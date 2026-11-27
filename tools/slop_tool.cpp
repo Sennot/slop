@@ -144,18 +144,26 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < secs.size(); i++) {
         auto& s = secs[i];
         double hh = r.ticks[s.ti[s.ti.size() / 2]].hh; // the first tick can still have the old size
-        std::vector<std::pair<double, double>> tried;      // factor, score
+        struct Try {
+            double f, score;
+            int diff;
+        };
+        std::vector<Try> tried;
         double best = -1;
         for (double f = .5; f <= 1.31; f += .05) {
             Params p = prm;
             p.hw = hh * f;
             solve(r, s, p);
-            tried.push_back({f, s.score});
+            int tight, diff;
+            stats(s, tight, diff);
+            tried.push_back({f, s.score, diff});
             best = std::max(best, s.score);
         }
+        // among the best (within 0.15%): fewest clicks whose tick window changed, then closest to square
         double pick = -1;
-        for (auto [f, sc] : tried) // among the best (within 0.15%), the one closest to a square hitbox
-            if (sc >= best - .15 && (pick < 0 || std::abs(f - 1) < std::abs(pick - 1))) pick = f;
+        int pd = 1 << 30;
+        for (auto const& t : tried)
+            if (t.score >= best - .15 && (t.diff < pd || (t.diff == pd && std::abs(t.f - 1) < std::abs(pick - 1)))) pick = t.f, pd = t.diff;
         bestHw[i] = hh * pick;
         Params p = prm;
         p.hw = bestHw[i];

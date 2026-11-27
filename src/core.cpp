@@ -260,6 +260,12 @@ static int find(Ivs const& v, double y) {
     return best;
 }
 
+static bool near(Ivs const& v, double y, double tol) {
+    for (auto const& i : v)
+        if (y >= i.lo - tol && y <= i.hi + tol) return true;
+    return false;
+}
+
 static bool inside(Ivs const& v, double y) {
     for (auto const& i : v)
         if (y >= i.lo - 1e-6 && y <= i.hi + 1e-6) return true;
@@ -483,7 +489,8 @@ static void windows(Route const& r, Section const& s, std::vector<Ivs> const& F,
                     std::vector<int> const& dir, std::vector<int>& lo, std::vector<int>& hi) {
     double k = s.mini ? 2 : 1;
     auto T = [&](std::size_t i) -> Tick const& { return r.ticks[s.ti[i]]; };
-    auto in = [](Interval const& c, double y) { return y >= c.lo - 1e-6 && y <= c.hi + 1e-6; };
+    constexpr double tol = .5; // sub-tick: a click riding the exact edge must not flip the window
+    auto in = [](Interval const& c, double y) { return y >= c.lo - tol && y <= c.hi + tol; };
     int n = (int)s.ti.size();
     lo.clear(), hi.clear();
     for (int i : s.clicks) {
@@ -491,14 +498,14 @@ static void windows(Route const& r, Section const& s, std::vector<Ivs> const& F,
         for (int sft = 1; sft <= 10 && i + sft < n; sft++) {
             double y = T(i).y;
             bool ok = true;
-            for (int j = i; j < i + sft && ok; j++) y += d0 * k * (T(j + 1).x - T(j).x), ok = inside(F[j + 1], y);
+            for (int j = i; j < i + sft && ok; j++) y += d0 * k * (T(j + 1).x - T(j).x), ok = near(F[j + 1], y, tol);
             if (!ok || !in(ch[i + sft], y)) break;
             h = sft;
         }
         for (int sft = 1; sft <= 10 && i - sft >= 0; sft++) {
             double y = T(i - sft).y;
             bool ok = true;
-            for (int j = i - sft; j < i && ok; j++) y += d1 * k * (T(j + 1).x - T(j).x), ok = inside(F[j + 1], y);
+            for (int j = i - sft; j < i && ok; j++) y += d1 * k * (T(j + 1).x - T(j).x), ok = near(F[j + 1], y, tol);
             if (!ok || !in(ch[i], y)) break;
             l = sft;
         }
