@@ -44,7 +44,7 @@ the slope version match best. Columns that matter:
 | column | good | if not |
 |---|---|---|
 | `anom` | 0 | the bot path goes through something -> see "Through objects" |
-| `fHaz`, `fSol` | 1.00 | <1 = hitbox shrunk by calibration; find what the bot touched |
+| `fHaz`, `fSol` | 1.00 | <1 = hitbox shrunk by calibration; find what the bot touched. `fHaz` ~0.8 from several plain spikes (id 8, 216) is real GD behaviour (rdas): leave it |
 | `match` | >= 99.5% | parts of < 30 ticks (mode switch bits) at 90-95% are fine |
 | `diff` | 0 | clicks whose tick window differs from the original |
 
