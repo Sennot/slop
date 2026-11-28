@@ -658,10 +658,18 @@ static void clipAgainst(Route const& r, Section& a, Section const& b) {
     std::vector<double> xs;
     for (auto t : b.ti) xs.push_back(r.ticks[t].x);
     double hh = r.ticks[b.ti[b.ti.size() / 2]].hh;
+    // Only the other wave's actual path counts, not its whole corridor: a structure between the
+    // two waves is the floor of one and the ceiling of the other and must stay.
+    double m = hh * (b.mini ? 3 : 2); // a 45° / 63° wall reaches the square hitbox this far
     auto chanAt = [&](double x, Interval& c) {
         if (x < xs.front() || x > xs.back()) return false;
-        std::size_t j = std::lower_bound(xs.begin(), xs.end(), x) - xs.begin();
-        c = b.chan[std::min(j, b.chan.size() - 1)];
+        std::size_t j = std::min<std::size_t>(std::lower_bound(xs.begin(), xs.end(), x) - xs.begin(), xs.size() - 1);
+        double y = r.ticks[b.ti[j]].y;
+        if (j > 0 && xs[j] > xs[j - 1]) {
+            double y0 = r.ticks[b.ti[j - 1]].y, f = (x - xs[j - 1]) / (xs[j] - xs[j - 1]);
+            y = y0 + (y - y0) * std::clamp(f, 0.0, 1.0);
+        }
+        c = {y - m, y + m};
         return true;
     };
     std::vector<Piece> keep;
@@ -673,7 +681,7 @@ static void clipAgainst(Route const& r, Section& a, Section const& b) {
             Interval c;
             double lo, hi;
             if (!chanAt(x, c) || !spanOver(p.poly, p.n, x - hh, x + hh, lo, hi)) continue;
-            hit = lo < c.hi + 2 * hh && hi > c.lo - 2 * hh; // the other wave needs that space
+            hit = lo < c.hi && hi > c.lo; // the other wave flies there
         }
         if (!hit) keep.push_back(p);
     }

@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
         bestHw[i] = pick->p.hw;
         solve(r, s, pick->p);
     }
-    separate(r, secs);
+    if (!std::getenv("SLOP_NOSEP")) separate(r, secs); // SLOP_NOSEP=1: see the dual parts unclipped
 
     if (cmd == "summary") {
         std::printf("ticks %zu obstacles %zu inputs %zu objects %zu\n", r.ticks.size(), r.obs.size(), r.inputs.size(), r.cands.size());
