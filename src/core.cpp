@@ -653,4 +653,38 @@ void solve(Route const& r, Section& s, Params const& prm) {
     windows(r, s, G, ch2, dir, s.genLo, s.genHi);
 }
 
+static void clipAgainst(Route const& r, Section& a, Section const& b) {
+    if (a.p == b.p || b.x1 < a.x0 || b.x0 > a.x1 || b.ti.empty()) return;
+    std::vector<double> xs;
+    for (auto t : b.ti) xs.push_back(r.ticks[t].x);
+    double hh = r.ticks[b.ti[b.ti.size() / 2]].hh;
+    auto chanAt = [&](double x, Interval& c) {
+        if (x < xs.front() || x > xs.back()) return false;
+        std::size_t j = std::lower_bound(xs.begin(), xs.end(), x) - xs.begin();
+        c = b.chan[std::min(j, b.chan.size() - 1)];
+        return true;
+    };
+    std::vector<Piece> keep;
+    for (auto const& p : a.pieces) {
+        double x0 = 1e18, x1 = -1e18;
+        for (int k = 0; k < p.n; k++) x0 = std::min(x0, p.poly[k].x), x1 = std::max(x1, p.poly[k].x);
+        bool hit = false;
+        for (double x = x0; x <= x1 + 1e-6 && !hit; x += std::max(.5, (x1 - x0) / 40)) {
+            Interval c;
+            double lo, hi;
+            if (!chanAt(x, c) || !spanOver(p.poly, p.n, x - hh, x + hh, lo, hi)) continue;
+            hit = lo < c.hi + 2 * hh && hi > c.lo - 2 * hh; // the other wave needs that space
+        }
+        if (!hit) keep.push_back(p);
+    }
+    a.pieces = std::move(keep);
+}
+
+void separate(Route const& r, std::vector<Section>& secs, int only) {
+    for (std::size_t i = 0; i < secs.size(); i++) {
+        if (only >= 0 && (int)i != only) continue;
+        for (std::size_t j = 0; j < secs.size(); j++)
+            if (i != j) clipAgainst(r, secs[i], secs[j]);
+    }
+}
 }

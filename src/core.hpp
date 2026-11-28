@@ -112,6 +112,9 @@ struct Section {
 
 std::vector<Section> split(Route const& r);
 void solve(Route const& r, Section& s, Params const& prm);
+// Dual: drops pieces of one player that reach into the other player's corridor.
+// only < 0 = every part, else only that part.
+void separate(Route const& r, std::vector<Section>& secs, int only = -1);
 
 constexpr int kMaxPoly = 16; // convex polygon vertices (circles are 16-gons)
 bool spanOver(V const* poly, int n, double x0, double x1, double& lo, double& hi);

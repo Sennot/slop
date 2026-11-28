@@ -734,6 +734,7 @@ class $modify(SlopUI, EditorUI) {
         g_routeDirty = false;
         bool two = twoGuess();
         for (size_t i = 0; i < n; i++) slop::solve(m_fields->route, m_fields->secs[i], params(i, two));
+        slop::separate(m_fields->route, m_fields->secs);
         m_fields->ext.assign(n, "");
         loadExternal();
         scanRisks();
@@ -880,6 +881,7 @@ class $modify(SlopUI, EditorUI) {
         m_fields->ext[i].clear(); // a manual tweak goes back to the own solve
         m_fields->margin[i] = std::clamp(m_fields->margin[i] + d, -20.0, 60.0);
         slop::solve(m_fields->route, m_fields->secs[i], params(i, twoGuess()));
+        slop::separate(m_fields->route, m_fields->secs, i);
         redrawRoute();
     }
 
@@ -894,7 +896,10 @@ class $modify(SlopUI, EditorUI) {
         }
         auto& s = m_fields->secs[i];
         auto const& r = m_fields->route;
-        if (m_fields->ext[i].empty()) slop::solve(r, s, params(i, fam.two != 0));
+        if (m_fields->ext[i].empty()) {
+            slop::solve(r, s, params(i, fam.two != 0));
+            slop::separate(r, m_fields->secs, (int)i);
+        }
         std::set<std::tuple<int, long, long>> keys;
         for (auto c : s.cands) {
             auto const& k = r.cands[c];
