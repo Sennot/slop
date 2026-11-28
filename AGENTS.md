@@ -82,6 +82,7 @@ Known causes and where they were fixed (all in `src/core.cpp` `solve()` unless n
 | steady ~1-2 units off on steep walls, mini parts low | hitbox not square | `Params::hw`, searched by slop_tool |
 | corridor ~20 units off after a merge | side corridor leaking into reachability | channel follows only the bot's tube |
 | click window off by 1 tick | edge precision | sub-tick tolerance in `windows()`, search over tol / wall scale |
+| dual: walls cross the middle, diamonds/fragments | each player's corridor walled alone | `separate()` drops pieces reaching into the other player's corridor |
 | many tiny parts at the same x | practice retries in the recording | `slop_tool clean in.bin out.bin` |
 | a broken stretch | bad recording there | `slop_tool cut in.bin out.bin x0 x1` (that part loses its walls) |
 

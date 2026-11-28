@@ -260,7 +260,7 @@ static int find(Ivs const& v, double y) {
     return best;
 }
 
-static bool near(Ivs const& v, double y, double tol) {
+static bool nearIv(Ivs const& v, double y, double tol) {
     for (auto const& i : v)
         if (y >= i.lo - tol && y <= i.hi + tol) return true;
     return false;
@@ -498,14 +498,14 @@ static void windows(Route const& r, Section const& s, std::vector<Ivs> const& F,
         for (int sft = 1; sft <= 10 && i + sft < n; sft++) {
             double y = T(i).y;
             bool ok = true;
-            for (int j = i; j < i + sft && ok; j++) y += d0 * k * (T(j + 1).x - T(j).x), ok = near(F[j + 1], y, tol);
+            for (int j = i; j < i + sft && ok; j++) y += d0 * k * (T(j + 1).x - T(j).x), ok = nearIv(F[j + 1], y, tol);
             if (!ok || !in(ch[i + sft], y)) break;
             h = sft;
         }
         for (int sft = 1; sft <= 10 && i - sft >= 0; sft++) {
             double y = T(i - sft).y;
             bool ok = true;
-            for (int j = i - sft; j < i && ok; j++) y += d1 * k * (T(j + 1).x - T(j).x), ok = near(F[j + 1], y, tol);
+            for (int j = i - sft; j < i && ok; j++) y += d1 * k * (T(j + 1).x - T(j).x), ok = nearIv(F[j + 1], y, tol);
             if (!ok || !in(ch[i], y)) break;
             l = sft;
         }
