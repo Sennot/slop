@@ -91,6 +91,9 @@ other levels' `.bin` did not get worse (run `summary` on 2-3 of them), write `pi
 (`git add -A; git commit -F msgfile; git -c credential.helper= -c "credential.helper=!gh auth git-credential" push`).
 Changes to `src/main.cpp` (recording, editor UI) need a mod build on GitHub Actions — read `CLAUDE.md` first.
 
+Local MSVC is not the CI compiler: names like `near`, `far`, `min`, `max` are Windows macros in
+the mod build — don't use them as identifiers in `src/`.
+
 ## Do not
 
 - do not rebuild/reinstall the mod for a per-level fix;
