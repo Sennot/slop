@@ -144,30 +144,32 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < secs.size(); i++) {
         auto& s = secs[i];
         double hh = r.ticks[s.ti[s.ti.size() / 2]].hh; // the first tick can still have the old size
+        // search hitbox width x fit tolerance x wall scale; keep the best match, then the fewest
+        // changed click windows, then the most "neutral" settings
         struct Try {
-            double f, score;
+            Params p;
+            double score, cost;
             int diff;
         };
         std::vector<Try> tried;
         double best = -1;
-        for (double f = .5; f <= 1.31; f += .05) {
-            Params p = prm;
-            p.hw = hh * f;
-            solve(r, s, p);
-            int tight, diff;
-            stats(s, tight, diff);
-            tried.push_back({f, s.score, diff});
-            best = std::max(best, s.score);
-        }
-        // among the best (within 0.15%): fewest clicks whose tick window changed, then closest to square
-        double pick = -1;
-        int pd = 1 << 30;
+        for (double f = .5; f <= 1.31; f += .05)
+            for (double tol : {prm.tol, prm.tol / 2})
+                for (double ws : {1.0, .97, 1.03}) {
+                    Params p = prm;
+                    p.hw = hh * f, p.tol = tol, p.wallScale = prm.wallScale * ws;
+                    solve(r, s, p);
+                    int tight, diff;
+                    stats(s, tight, diff);
+                    double cost = std::abs(f - 1) + std::abs(ws - 1) * 3 + (tol != prm.tol) * .05;
+                    tried.push_back({p, s.score, cost, diff});
+                    best = std::max(best, s.score);
+                }
+        Try const* pick = nullptr;
         for (auto const& t : tried)
-            if (t.score >= best - .15 && (t.diff < pd || (t.diff == pd && std::abs(t.f - 1) < std::abs(pick - 1)))) pick = t.f, pd = t.diff;
-        bestHw[i] = hh * pick;
-        Params p = prm;
-        p.hw = bestHw[i];
-        solve(r, s, p);
+            if (t.score >= best - .15 && (!pick || t.diff < pick->diff || (t.diff == pick->diff && t.cost < pick->cost))) pick = &t;
+        bestHw[i] = pick->p.hw;
+        solve(r, s, pick->p);
     }
 
     if (cmd == "summary") {
