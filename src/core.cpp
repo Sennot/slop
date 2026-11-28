@@ -657,33 +657,55 @@ static void clipAgainst(Route const& r, Section& a, Section const& b) {
     if (a.p == b.p || b.x1 < a.x0 || b.x0 > a.x1 || b.ti.empty()) return;
     std::vector<double> xs;
     for (auto t : b.ti) xs.push_back(r.ticks[t].x);
-    double hh = r.ticks[b.ti[b.ti.size() / 2]].hh;
-    // Only the other wave's actual path counts, not its whole corridor: a structure between the
-    // two waves is the floor of one and the ceiling of the other and must stay.
-    double m = hh * (b.mini ? 3 : 2); // a 45° / 63° wall reaches the square hitbox this far
-    auto chanAt = [&](double x, Interval& c) {
+    double hh = r.ticks[b.ti[b.ti.size() / 2]].hh, es = hh * b.fSolid;
+    // A piece of `a` is in the way only where it would hit the other wave on its real path. Testing
+    // against the other wave's whole corridor is exact but deletes most of both waves' walls where
+    // the corridors overlap (crossings), which reads as holes.
+    auto pathAt = [&](double x, double& y) {
         if (x < xs.front() || x > xs.back()) return false;
         std::size_t j = std::min<std::size_t>(std::lower_bound(xs.begin(), xs.end(), x) - xs.begin(), xs.size() - 1);
-        double y = r.ticks[b.ti[j]].y;
+        y = r.ticks[b.ti[j]].y;
         if (j > 0 && xs[j] > xs[j - 1]) {
-            double y0 = r.ticks[b.ti[j - 1]].y, f = (x - xs[j - 1]) / (xs[j] - xs[j - 1]);
-            y = y0 + (y - y0) * std::clamp(f, 0.0, 1.0);
+            double y0 = r.ticks[b.ti[j - 1]].y, f = std::clamp((x - xs[j - 1]) / (xs[j] - xs[j - 1]), 0.0, 1.0);
+            y = y0 + (y - y0) * f;
         }
-        c = {y - m, y + m};
         return true;
+    };
+    auto hitAt = [&](Piece const& p, double x) {
+        double y, lo, hi;
+        if (!pathAt(x, y) || !spanOver(p.poly, p.n, x - hh, x + hh, lo, hi)) return false;
+        return lo - es - 1 < y && hi + es + 1 > y;
     };
     std::vector<Piece> keep;
     for (auto const& p : a.pieces) {
-        double x0 = 1e18, x1 = -1e18;
-        for (int k = 0; k < p.n; k++) x0 = std::min(x0, p.poly[k].x), x1 = std::max(x1, p.poly[k].x);
-        bool hit = false;
-        for (double x = x0; x <= x1 + 1e-6 && !hit; x += std::max(.5, (x1 - x0) / 40)) {
-            Interval c;
-            double lo, hi;
-            if (!chanAt(x, c) || !spanOver(p.poly, p.n, x - hh, x + hh, lo, hi)) continue;
-            hit = lo < c.hi && hi > c.lo; // the other wave flies there
+        double x0 = 1e18, x1 = -1e18, y0 = 1e18, y1 = -1e18;
+        for (int k = 0; k < p.n; k++)
+            x0 = std::min(x0, p.poly[k].x), x1 = std::max(x1, p.poly[k].x), y0 = std::min(y0, p.poly[k].y), y1 = std::max(y1, p.poly[k].y);
+        double step = std::max(.5, (x1 - x0) / 60);
+        if (p.kind != Kind::Flat) { // slopes: all or nothing
+            bool hit = false;
+            for (double x = x0; x <= x1 + 1e-6 && !hit; x += step) hit = hitAt(p, x);
+            if (!hit) keep.push_back(p);
+            continue;
         }
-        if (!hit) keep.push_back(p);
+        // blocks: keep the stretches that are not in the way
+        double from = x0;
+        bool open = !hitAt(p, x0);
+        auto emit = [&](double a0, double a1) {
+            if (a1 - a0 < 1) return;
+            Piece q = p;
+            rect(q, a0, y0, a1, y1);
+            q.ceil = p.ceil, q.tight = p.tight;
+            keep.push_back(q);
+        };
+        for (double x = x0 + step; x <= x1 + 1e-6; x += step) {
+            bool ok = !hitAt(p, x);
+            if (ok == open) continue;
+            if (open) emit(from, x - step);
+            else from = x;
+            open = ok;
+        }
+        if (open) emit(from, x1);
     }
     a.pieces = std::move(keep);
 }
